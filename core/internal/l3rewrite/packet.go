@@ -52,6 +52,9 @@ func parsePacket(data []byte) (*packet, error) {
 	if err := parser.DecodeLayers(data, &decoded); err != nil {
 		return nil, fmt.Errorf("decode layers: %w", err)
 	}
+	if parser.Truncated {
+		return nil, fmt.Errorf("truncated IP packet")
+	}
 
 	hasTCP := false
 	for _, lt := range decoded {

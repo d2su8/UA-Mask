@@ -29,8 +29,10 @@ const (
 )
 
 const (
-	maxQueueLen  = 4000
-	maxPacketLen = 1600
+	maxQueueLen = 4000
+	// Request the full IP packet. Netlink may still truncate at its attribute
+	// size limit, so CapLen and the IP decoder must also be checked.
+	maxPacketLen = 65535
 	workerChan   = 2000
 )
 
@@ -181,16 +183,25 @@ func (s *linuxServer) cleanupRules() error {
 	return nil
 }
 
+type packetQueue interface {
+	SetVerdict(uint32, int) error
+	SetVerdictWithOption(uint32, int, ...nfq.VerdictOption) error
+	Close() error
+}
+
 // nfqueueServer receives packets queued by the firewall rules and applies the
 // configured TCP/IP header rewrites before re-injecting them.
 type nfqueueServer struct {
-	queueNum uint16
-	cfg      Config
-	log      *logrus.Logger
-	nf       *nfq.Nfqueue
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	chans    []chan *nfq.Attribute
+	queueNum   uint16
+	cfg        Config
+	log        *logrus.Logger
+	nf         packetQueue
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	chans      []chan *nfq.Attribute
+	callbackMu sync.Mutex
+	stopping   bool
+	closeOnce  sync.Once
 }
 
 func (s *nfqueueServer) Start() error {
@@ -224,23 +235,7 @@ func (s *nfqueueServer) Start() error {
 	}
 
 	err = nf.RegisterWithErrorFunc(ctx,
-		func(a nfq.Attribute) int {
-			if a.Payload == nil || a.PacketID == nil {
-				if a.PacketID != nil {
-					_ = nf.SetVerdict(*a.PacketID, nfq.NfAccept)
-				}
-				return 0
-			}
-			idx := int(flowHash(*a.Payload)) % workers
-			select {
-			case s.chans[idx] <- &a:
-			default:
-				// Queue full: accept the packet without processing to avoid
-				// stalling traffic.
-				_ = nf.SetVerdict(*a.PacketID, nfq.NfAccept)
-			}
-			return 0
-		},
+		s.enqueue,
 		func(e error) int {
 			if ctx.Err() != nil {
 				return 0
@@ -250,24 +245,54 @@ func (s *nfqueueServer) Start() error {
 		},
 	)
 	if err != nil {
+		s.Close()
 		return fmt.Errorf("nf.RegisterWithErrorFunc: %w", err)
 	}
 	return nil
 }
 
-func (s *nfqueueServer) Close() {
-	if s.cancel != nil {
-		s.cancel()
+func (s *nfqueueServer) enqueue(a nfq.Attribute) int {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
+	if s.stopping {
+		return 1 // Stop receiving; the worker channels are already closed.
 	}
-	for _, ch := range s.chans {
-		if ch != nil {
-			close(ch)
+	if a.Payload == nil || a.PacketID == nil {
+		if a.PacketID != nil {
+			_ = s.nf.SetVerdict(*a.PacketID, nfq.NfAccept)
 		}
+		return 0
 	}
-	s.wg.Wait()
-	if s.nf != nil {
-		_ = s.nf.Close()
+	// Reduce in the unsigned domain before converting on 32-bit routers.
+	idx := int(flowHash(*a.Payload) % uint32(len(s.chans)))
+	select {
+	case s.chans[idx] <- &a:
+	default:
+		// Queue full: accept without processing to avoid stalling traffic.
+		_ = s.nf.SetVerdict(*a.PacketID, nfq.NfAccept)
 	}
+	return 0
+}
+
+func (s *nfqueueServer) Close() {
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		// Wait for any active producer and prevent later callbacks from sending.
+		s.callbackMu.Lock()
+		s.stopping = true
+		for _, ch := range s.chans {
+			if ch != nil {
+				close(ch)
+			}
+		}
+		s.callbackMu.Unlock()
+		s.wg.Wait()
+		if s.nf != nil {
+			_ = s.nf.Close()
+		}
+	})
 }
 
 func (s *nfqueueServer) worker(ch <-chan *nfq.Attribute) {
@@ -281,7 +306,7 @@ func (s *nfqueueServer) handle(a *nfq.Attribute) {
 	if a == nil || a.PacketID == nil {
 		return
 	}
-	if a.Payload == nil {
+	if a.Payload == nil || (a.CapLen != nil && uint64(*a.CapLen) > uint64(len(*a.Payload))) {
 		_ = s.nf.SetVerdict(*a.PacketID, nfq.NfAccept)
 		return
 	}

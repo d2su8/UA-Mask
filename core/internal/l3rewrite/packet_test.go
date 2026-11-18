@@ -1,12 +1,56 @@
 package l3rewrite
 
 import (
+	"bytes"
 	"net"
 	"testing"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
+
+func TestRewriteLargeAndTruncatedPackets(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		name := "IPv4"
+		if ipv6 {
+			name = "IPv6"
+		}
+		t.Run(name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{0x42}, 4000)
+			tcp := synTCP(1024, false)
+			var network gopacket.NetworkLayer = &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Id: 123, Protocol: layers.IPProtocolTCP, SrcIP: net.IPv4(192, 168, 1, 10), DstIP: net.IPv4(8, 8, 8, 8)}
+			if ipv6 {
+				network = &layers.IPv6{Version: 6, HopLimit: 64, NextHeader: layers.IPProtocolTCP, SrcIP: net.ParseIP("2001:db8::1"), DstIP: net.ParseIP("2001:db8::2")}
+			}
+			if err := tcp.SetNetworkLayerForChecksum(network); err != nil {
+				t.Fatal(err)
+			}
+			buf := gopacket.NewSerializeBuffer()
+			if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}, network.(gopacket.SerializableLayer), tcp, gopacket.Payload(payload)); err != nil {
+				t.Fatal(err)
+			}
+			data := buf.Bytes()
+			cfg := Config{IPID: true, TCPWIN: true}
+			for _, length := range []int{1600, len(data) - 1} {
+				out, changed, err := rewrite(data[:length], cfg)
+				if err == nil || changed || out != nil {
+					t.Fatalf("truncated packet rewritten: length=%d changed=%v err=%v", length, changed, err)
+				}
+			}
+			out, changed, err := rewrite(data, cfg)
+			if err != nil || !changed {
+				t.Fatalf("complete packet: changed=%v err=%v", changed, err)
+			}
+			p, err := parsePacket(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out) != len(data) || !bytes.Equal(p.tcp.Payload, payload) {
+				t.Fatal("large packet payload was changed")
+			}
+		})
+	}
+}
 
 func buildIPv4TCP(t *testing.T, tcp *layers.TCP, ipID uint16) []byte {
 	t.Helper()
